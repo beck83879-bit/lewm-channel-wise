@@ -1,0 +1,11 @@
+# @package _global_
+defaults:
+  - learned
+  - _self_
+arm_name: random336_active192
+model:
+  predictor:
+    routing:
+      mode: random
+  routing_credit:
+    enabled: false

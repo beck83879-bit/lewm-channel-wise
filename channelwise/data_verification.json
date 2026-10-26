@@ -1,0 +1,9 @@
+{
+  "verified_date": "2026-10-26",
+  "method": "full_file_sha256_on_both_servers",
+  "a6000": "210.28.134.201:/home/wangtz/.stable-wm/cube_single_expert.h5",
+  "a100": "210.28.132.145:/home/wangtz/.lewam/datasets/cube.h5",
+  "sha256": "0664d507c4ff12009010644c9ae950836f954e700c172ccf22e7423af1a55625",
+  "bytes": 101942558720,
+  "identical": true
+}

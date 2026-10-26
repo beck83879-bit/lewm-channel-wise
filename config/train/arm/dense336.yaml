@@ -1,0 +1,7 @@
+# @package _global_
+arm_name: dense336
+model:
+  predictor:
+    hidden_dim: 336
+    routing:
+      enabled: false

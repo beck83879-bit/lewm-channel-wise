@@ -1,0 +1,11 @@
+defaults:
+  - cube
+  - _self_
+cache_dir: null
+eval:
+  dataset_name: ${oc.env:CUBE_DATASET}
+plan_config:
+  history_len: 3
+output:
+  directory: ???
+  video: false

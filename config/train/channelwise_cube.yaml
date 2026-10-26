@@ -1,0 +1,42 @@
+defaults:
+  - lewm
+  - _self_
+  - arm: learned
+  - override data: ogb
+
+subdir: cube_${arm_name}_seed${seed}
+output_model_name: ${subdir}
+seed: 3072
+history_size: 3
+num_preds: 1
+num_workers: 6
+train_split: 0.9
+data:
+  dataset:
+    name: ${oc.env:CUBE_DATASET}
+    num_steps: 4
+    frameskip: 5
+trainer:
+  max_epochs: 10
+  devices: 1
+  accelerator: gpu
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+loader:
+  batch_size: 128
+loss:
+  sigreg:
+    weight: 0.1
+wandb:
+  enabled: false
+model:
+  _target_: channelwise.model.JEPA
+  predictor:
+    _target_: channelwise.predictor.ChannelwiseARPredictor
+  routing_credit:
+    enabled: false
+    weight: 0.01
+    interval: 8
+    warmup_steps: 100
+    min_margin: 1.0e-5
+    relative_margin: 1.0e-3

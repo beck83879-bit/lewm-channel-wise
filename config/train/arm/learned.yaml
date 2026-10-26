@@ -1,0 +1,23 @@
+# @package _global_
+arm_name: learned336_active192
+model:
+  predictor:
+    hidden_dim: 336
+    routing:
+      enabled: true
+      sparse_compute: true
+      mode: learned
+      shared_dim: 144
+      group_size: 48
+      top_k: 1
+      selected_weight_mode: binary
+      router_hidden_dim: 128
+      warmup_steps: 100
+      balance_enabled: true
+      balance_ema: 0.95
+      balance_min_factor: 0.8
+      balance_max_factor: 1.2
+      bias_lr: 0.05
+      bias_clip: 2.0
+  routing_credit:
+    enabled: true

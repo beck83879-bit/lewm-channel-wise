@@ -1,0 +1,7 @@
+# @package _global_
+arm_name: original192
+model:
+  predictor:
+    hidden_dim: 192
+    routing:
+      enabled: false
