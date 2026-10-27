@@ -1,0 +1,9 @@
+defaults:
+  - channelwise_cube
+  - _self_
+
+trainer:
+  devices: 4
+  strategy: ddp_find_unused_parameters_true
+loader:
+  batch_size: 32

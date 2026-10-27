@@ -1,52 +1,73 @@
 """Selected-coordinate LeWM prediction with causal, prefix-local routing."""
 
 import torch
-from torch import nn
 from torch.nn import functional as F
 
 from module import ARPredictor
 from .channel_routing import ChannelRouting
+from .source_ops import SourceSparseOps
 
 
-def selected_norm(x, norm, indices):
-    weight = norm.weight.index_select(0, indices) if norm.weight is not None else None
-    bias = norm.bias.index_select(0, indices) if norm.bias is not None else None
-    return F.layer_norm(x, (indices.numel(),), weight, bias, norm.eps)
+def selected_bank(linear, active_indices, *, rows=False, cols=False, modulation=0):
+    """Map LeWM's parameter names and six-way AdaLN to the source bank layout."""
+    weights, biases = [], []
+    for indices in active_indices:
+        selected_rows = (torch.cat([indices + i * linear.in_features
+                                    for i in range(modulation)]) if modulation
+                         else indices if rows else None)
+        weight = linear.weight
+        if selected_rows is not None:
+            weight = weight.index_select(0, selected_rows)
+        if cols:
+            weight = weight.index_select(1, indices)
+        weights.append(weight)
+        if linear.bias is not None:
+            biases.append(linear.bias if selected_rows is None
+                          else linear.bias.index_select(0, selected_rows))
+    return torch.stack(weights), torch.stack(biases) if biases else None
 
 
-def active_block(block, x, condition, indices, full_width):
-    """Preserve LeWM's two branches, including their inner LayerNorms."""
-    rows = torch.cat([indices + i * full_width for i in range(6)])
-    modulation = block.adaLN_modulation[-1]
-    mod = F.linear(
-        F.silu(condition),
-        modulation.weight.index_select(0, rows).index_select(1, indices),
-        modulation.bias.index_select(0, rows),
-    )
-    shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = mod.chunk(6, dim=-1)
-    attention = block.attn
-    h = selected_norm(x, block.norm1, indices) * (1 + scale_a) + shift_a
-    h = selected_norm(h, attention.norm, indices)
-    qkv = F.linear(h, attention.to_qkv.weight.index_select(1, indices)).chunk(3, -1)
-    q, k, v = [value.reshape(*value.shape[:2], attention.heads, -1).transpose(1, 2)
-               for value in qkv]
-    h = F.scaled_dot_product_attention(
-        q, k, v, dropout_p=attention.dropout if block.training else 0.0,
-        is_causal=True,
-    ).transpose(1, 2).flatten(2)
-    if not isinstance(attention.to_out, nn.Sequential):
-        raise ValueError("Selected-coordinate attention requires an output projection")
-    projection, dropout = attention.to_out
-    h = dropout(F.linear(h, projection.weight.index_select(0, indices),
-                         projection.bias.index_select(0, indices)))
-    x = x + gate_a * h
-    h = selected_norm(x, block.norm2, indices) * (1 + scale_m) + shift_m
-    norm, up, activation, dropout1, down, dropout2 = block.mlp.net
-    h = selected_norm(h, norm, indices)
-    h = dropout1(activation(F.linear(h, up.weight.index_select(1, indices), up.bias)))
-    h = dropout2(F.linear(h, down.weight.index_select(0, indices),
-                          down.bias.index_select(0, indices)))
-    return x + gate_m * h
+def batched_selected_norm(x, norm, indices):
+    if norm.weight is None:
+        return F.layer_norm(x, (indices.size(-1),), eps=norm.eps)
+    weight = norm.weight[indices]
+    bias = norm.bias[indices] if norm.bias is not None else None
+    return torch.vmap(F.layer_norm, in_dims=(0, None, 0, 0 if bias is not None else None, None))(
+        x, (indices.size(-1),), weight, bias, norm.eps)
+
+
+def batched_active_block(block, x, condition, selected_groups, active_indices):
+    """Source gather/batched-linear/scatter execution, with LeWM's two branches."""
+    indices = active_indices.index_select(0, selected_groups)
+    state_indices = indices[:, None, :].expand(-1, x.size(1), -1)
+    h = x.gather(-1, state_indices)
+    active_condition = condition.gather(-1, state_indices)
+    sa = block.attn
+    mlp = block.mlp.net
+    banks = {
+        "mod": selected_bank(block.adaLN_modulation[-1], active_indices,
+                             cols=True, modulation=6),
+        "sa_qkv": selected_bank(sa.to_qkv, active_indices, cols=True),
+        "sa_out": selected_bank(sa.to_out[0], active_indices, rows=True),
+        "mlp_up": selected_bank(mlp[1], active_indices, cols=True),
+        "mlp_down": selected_bank(mlp[4], active_indices, rows=True),
+    }
+    linear = lambda tensor, name: SourceSparseOps._batched_linear(
+        tensor, banks[name], selected_groups)
+    mod = linear(F.silu(active_condition), "mod")
+    shift_sa, scale_sa, gate_sa, shift_mlp, scale_mlp, gate_mlp = mod.chunk(6, dim=-1)
+    sa_input = batched_selected_norm(h, block.norm1, indices) * (1 + scale_sa) + shift_sa
+    sa_input = batched_selected_norm(sa_input, sa.norm, indices)
+    q, k, v = linear(sa_input, "sa_qkv").chunk(3, dim=-1)
+    mask = torch.ones(x.size(1), x.size(1), dtype=torch.bool, device=x.device).tril()
+    sa_result = SourceSparseOps._active_attention(
+        q, k, v, sa.heads, sa.scale, sa.dropout, block.training, mask)
+    h = h + gate_sa * sa.to_out[1](linear(sa_result, "sa_out"))
+    mlp_input = batched_selected_norm(h, block.norm2, indices) * (1 + scale_mlp) + shift_mlp
+    mlp_input = batched_selected_norm(mlp_input, mlp[0], indices)
+    intermediate = mlp[3](mlp[2](linear(mlp_input, "mlp_up")))
+    updated = h + gate_mlp * mlp[5](linear(intermediate, "mlp_down"))
+    return x.scatter(-1, state_indices, updated)
 
 
 class ChannelwiseARPredictor(ARPredictor):
@@ -112,30 +133,12 @@ class ChannelwiseARPredictor(ARPredictor):
             selected = weights[:, 0, self.routing.shared_dim:]
             selected = selected.reshape(x.size(0), self.routing.groups,
                                         self.routing.group_size).sum(-1).argmax(-1)
-            updated = x.clone()
-            for group in range(self.routing.groups):
-                members = (selected == group).nonzero(as_tuple=True)[0]
-                if not members.numel():
-                    continue
-                indices = self.active_indices[group]
-                previous = x.index_select(0, members)
-                active = previous.index_select(-1, indices)
-                active_condition = condition.index_select(0, members).index_select(-1, indices)
-                result = active_block(block, active, active_condition, indices, x.size(-1))
-                written = previous.scatter(-1, indices[None, None].expand_as(result), result)
-                updated = updated.index_copy(0, members, written)
-            x = updated
-        output = x.new_zeros((x.size(0), 1, transformer.output_proj.out_features))
-        for group in range(self.routing.groups):
-            members = (selected == group).nonzero(as_tuple=True)[0]
-            if not members.numel():
-                continue
-            indices = self.active_indices[group]
-            h = x.index_select(0, members)[:, -1:].index_select(-1, indices)
-            h = selected_norm(h, transformer.norm, indices)
-            h = F.linear(h, transformer.output_proj.weight.index_select(1, indices),
-                         transformer.output_proj.bias)
-            output = output.index_copy(0, members, h)
+            x = batched_active_block(block, x, condition, selected, self.active_indices)
+        indices = self.active_indices.index_select(0, selected)
+        h = x[:, -1:].gather(-1, indices[:, None, :])
+        h = batched_selected_norm(h, transformer.norm, indices)
+        output = SourceSparseOps._batched_linear(
+            h, selected_bank(transformer.output_proj, self.active_indices, cols=True), selected)
         return output, self.routing.get_last_route_trace() if recording else None
 
     def forward(self, x, c, *, routing_overrides=None, routing_record=None):

@@ -1,4 +1,43 @@
 
+# lewm-channel-wise
+
+Channel-wise predictor experiments built on LeWorldModel (LeWM), with the
+routing mechanism ported from `ZitongWang018/flow-jepa@f5763aa`.
+This is an experimental extension, not the official LeWM repository.
+
+**Implementation, reproduction commands and comparison limits:**
+[Channel-wise documentation](channelwise/README.md).
+
+## Cube Results (2026-10-27)
+
+Both models were trained from scratch for 10 epochs with training seed 3072,
+four DDP ranks and batch32 per rank (global batch128). Each evaluation seed
+uses 50 matched starts, native dataset replay, goal offset25, budget50 and
+CEM300 candidates / 30 iterations / top30. Both pipelines completed normally.
+
+| Evaluation seed | LeWM baseline | Channel-wise |
+|---|---:|---:|
+| 42 | 70% | 78% |
+| 43 | 82% | 84% |
+| 44 | 74% | 70% |
+| Mean | 75.3% | 77.3% |
+
+Matched cases: 8 failures became successes, 5 successes became failures,
+and 137 outcomes were unchanged. This is a 2 percentage point improvement
+for one training seed, not evidence of a statistically established gain.
+LeWM reports 74% on Cube in Figure 6. Four-rank local BatchNorm/SIGReg
+statistics differ from single-GPU batch128, so this is not an exact replication
+of that training setup. Equal active width also does not imply equal total
+parameters or compute. No checkpoints or datasets are included here.
+
+Final validation prediction MSE: baseline 0.001441, channel-wise 0.001635.
+Total validation loss: baseline 0.13199, channel-wise 0.12955; the lower total
+loss comes from the regularization term, not lower prediction error.
+
+The original LeWM documentation and attribution follow below.
+
+---
+
 # LeWorldModel
 ### Stable End-to-End Joint-Embedding Predictive Architecture from Pixels
 

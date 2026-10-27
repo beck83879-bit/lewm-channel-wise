@@ -1,15 +1,19 @@
 import copy
+import ast
 import hashlib
 import io
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from module import ARPredictor, ConditionalBlock, MLP
 from channelwise.model import JEPA
-from channelwise.predictor import ChannelwiseARPredictor, active_block
+from channelwise.predictor import ChannelwiseARPredictor, batched_active_block
+from channelwise.source_ops import SourceSparseOps
 
 
 def build(mode="learned", dropout=0.0):
@@ -39,9 +43,76 @@ class ChannelwiseTests(unittest.TestCase):
             "jepa.py": "41bad7fd21e0f14aea4c9c3d39a9c87037e787746d953ab62cdc0677e938ce96",
             "train.py": "5d5666a785148635f8bcb50b49f98dd4527c5aba8a02d90206eb5d46406079d2",
             "channelwise/channel_routing.py": "6a221fc2bab0ba86ea105c992562ef7ba9df997e1879e28ea80b58a5fbc3fc85",
+            "channelwise/sparse_linear.py": "3bdb071237ca091da2b2ca0d525fcdf31aeb6c00cf705bd1fe645b854ada1359",
         }
         for name, digest in expected.items():
             self.assertEqual(hashlib.sha256((root / name).read_bytes()).hexdigest(), digest, name)
+
+    def test_sparse_primitives_match_source_text(self):
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "channelwise/source_ops.py").read_text()
+        tree = ast.parse(source)
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef))
+        # Source fingerprints are independent of the installed Python AST version.
+        expected = {
+            "_active_attention": "3399d386af735b943cc869a6df89e9ceb239f4619a3d20a9b138fd8f02d32869",
+            "_batched_linear": "f74c1ec0926bc0be7a605c2afd631ec29d5e2eb5f843a6ff26a4274383309a9c",
+        }
+        for node in cls.body:
+            if isinstance(node, ast.FunctionDef):
+                digest = hashlib.sha256(ast.get_source_segment(source, node).encode()).hexdigest()
+                self.assertEqual(digest, expected.pop(node.name))
+        self.assertEqual(expected, {})
+
+    def _assert_swap_dropout_masks_match(self, device):
+        predictor = build(dropout=0.5).to(device).train()
+        initialize_gates(predictor)
+        batch, length = 4, 3
+        mask = torch.zeros(batch * length, 4, device=device, dtype=torch.bool)
+        groups = torch.arange(batch, device=device).repeat(length)
+        mask.scatter_(1, groups[:, None], True)
+        original = [{"mask": mask.clone(), "weights": mask.float()} for _ in range(3)]
+        swapped = copy.deepcopy(original)
+        swap_groups = torch.tensor([1, 0, 2, 3], device=device).repeat(length)
+        swapped[0]["mask"].zero_().scatter_(1, swap_groups[:, None], True)
+        swapped[0]["weights"] = swapped[0]["mask"].float()
+        x = torch.randn(batch, length, 12, device=device)
+        c = torch.randn_like(x)
+        source_dropout = F.dropout
+
+        def probe(overrides):
+            masks = []
+
+            def dropout(inputs, p=0.5, training=True, inplace=False):
+                applied = source_dropout(torch.ones_like(inputs), p, training, False)
+                if training and p:
+                    masks.append(applied.detach().clone())
+                return inputs.mul_(applied) if inplace else inputs * applied
+
+            devices = [torch.cuda.current_device()] if device == "cuda" else []
+            with torch.random.fork_rng(devices=devices), torch.no_grad(), patch.object(F, "dropout", dropout):
+                torch.manual_seed(20261027)
+                if device == "cuda":
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        output = predictor(x, c, routing_overrides=overrides)
+                else:
+                    output = predictor(x, c, routing_overrides=overrides)
+            return output, masks
+
+        first, first_masks = probe(original)
+        second, second_masks = probe(swapped)
+        self.assertFalse(torch.equal(first, second))
+        self.assertEqual(len(first_masks), length * 3 * 4)
+        self.assertEqual(len(first_masks), len(second_masks))
+        for index, (a, b) in enumerate(zip(first_masks, second_masks)):
+            self.assertTrue(torch.equal(a, b), f"Dropout call {index} changed sample masks")
+
+    def test_swapped_routes_preserve_each_sample_dropout_cpu(self):
+        self._assert_swap_dropout_masks_match("cpu")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_swapped_routes_preserve_each_sample_dropout_cuda(self):
+        self._assert_swap_dropout_masks_match("cuda")
 
     def test_disabled_is_exact_upstream(self):
         args = dict(num_frames=3, input_dim=12, hidden_dim=28, output_dim=12,
@@ -80,13 +151,43 @@ class ChannelwiseTests(unittest.TestCase):
         reduced.load_state_dict(target, strict=True)
         x = torch.randn(4, 3, 16, requires_grad=True)
         c = torch.randn(4, 3, 16, requires_grad=True)
-        actual = active_block(full, x, c, indices, 28)
+        full_x = x.new_zeros(4, 3, 28).scatter(-1, indices[None, None].expand_as(x), x)
+        full_c = c.new_zeros(4, 3, 28).scatter(-1, indices[None, None].expand_as(c), c)
+        actual = batched_active_block(full, full_x, full_c, torch.zeros(4, dtype=torch.long),
+                                      indices[None]).index_select(-1, indices)
         expected = reduced(x, c)
         torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
         actual_grad = torch.autograd.grad(actual.square().mean(), (x, c), retain_graph=True)
         expected_grad = torch.autograd.grad(expected.square().mean(), (x, c))
         for a, e in zip(actual_grad, expected_grad):
             torch.testing.assert_close(a, e, rtol=1e-4, atol=1e-6)
+
+    def test_real_widths_compute_selected_submatrices(self):
+        block = ConditionalBlock(336, 16, 64, 2048, 0.0).eval()
+        nn.init.normal_(block.adaLN_modulation[-1].weight, std=0.03)
+        indices = torch.stack([torch.cat((torch.arange(144), torch.arange(
+            144 + group * 48, 192 + group * 48))) for group in range(4)])
+        x, c = torch.randn(2, 3, 336), torch.randn(2, 3, 336)
+        groups = torch.tensor([0, 3])
+        shapes = []
+        source_linear = SourceSparseOps._batched_linear
+
+        def observe(inputs, bank, selected, *args, **kwargs):
+            shapes.append((inputs.size(-1), tuple(bank[0].shape[1:])))
+            return source_linear(inputs, bank, selected, *args, **kwargs)
+
+        with patch.object(SourceSparseOps, "_batched_linear", observe), \
+                patch.object(block, "forward", side_effect=AssertionError("Full block invoked")), \
+                patch.object(block.attn, "forward", side_effect=AssertionError("Full attention invoked")), \
+                patch.object(block.mlp, "forward", side_effect=AssertionError("Full MLP invoked")):
+            actual = batched_active_block(block, x, c, groups, indices)
+        self.assertEqual(shapes, [(192, (1152, 192)), (192, (3072, 192)),
+                                  (1024, (192, 1024)), (192, (2048, 192)),
+                                  (2048, (192, 2048))])
+        active = torch.zeros_like(x, dtype=torch.bool)
+        active.scatter_(-1, indices[groups][:, None, :].expand(-1, 3, -1), True)
+        self.assertTrue(torch.equal(actual[~active], x[~active]))
+        self.assertFalse(torch.equal(actual[active], x[active]))
 
     def test_routing_is_causal(self):
         predictor = build().eval()

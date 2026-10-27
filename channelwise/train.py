@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from functools import partial
+from itertools import islice
 from pathlib import Path
 
 import hydra
@@ -13,6 +14,7 @@ import stable_worldmodel as swm
 import torch
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger
+from lightning.pytorch.utilities.rank_zero import rank_zero_only
 from omegaconf import OmegaConf, open_dict
 from stable_pretraining._config import get_config as get_spt_config
 
@@ -33,6 +35,61 @@ class RoutingStepCallback(pl.Callback):
             pl_module.log_dict({f"train/route_{key}": value for key, value in metrics.items()},
                                on_step=True, on_epoch=False, sync_dist=False)
         self.last_step = int(trainer.global_step)
+
+
+class DistributedRuntimeCallback(pl.Callback):
+    """Record actual runtime topology; optional smoke checks do not change losses."""
+
+    def __init__(self, run_dir, verify=False):
+        self.run_dir = run_dir
+        self.verify = verify
+
+    def on_train_start(self, trainer, pl_module):
+        loader = trainer.train_dataloader
+        sampler = loader.sampler
+        details = {
+            "rank": trainer.global_rank, "world_size": trainer.world_size,
+            "device": str(pl_module.device), "local_batch_size": loader.batch_size,
+            "global_batch_size": loader.batch_size * trainer.world_size,
+            "sampler": type(sampler).__name__, "train_batches_per_rank": len(loader),
+            "global_step": int(trainer.global_step),
+            "optimizer_initial_lrs": [group.get("initial_lr")
+                                      for group in trainer.optimizers[0].param_groups],
+        }
+        if isinstance(sampler, torch.utils.data.DistributedSampler):
+            details["sampler_rank"] = sampler.rank
+            details["first_sample_indices"] = list(islice(iter(sampler), 8))
+        runtime = self.run_dir / "runtime"
+        runtime.mkdir(parents=True, exist_ok=True)
+        (runtime / f"rank{trainer.global_rank}.json").write_text(json.dumps(details, indent=2))
+        print("DISTRIBUTED_RUNTIME", json.dumps(details), flush=True)
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        step = int(trainer.global_step)
+        if not self.verify or step not in {1, 101, 105, 106, 107}:
+            return
+        details = {"rank": trainer.global_rank, "step": step}
+        routing = getattr(pl_module.model.predictor, "routing", None)
+        if routing is not None:
+            state = torch.cat((routing.usage_ema.flatten(), routing.selection_bias.flatten()))
+            if torch.distributed.is_initialized():
+                states = [torch.empty_like(state) for _ in range(trainer.world_size)]
+                torch.distributed.all_gather(states, state)
+                if not all(torch.equal(state, other) for other in states):
+                    raise RuntimeError("Routing load/bias differs across DDP ranks")
+            details["routing_step"] = int(routing.step)
+        for key in ("train/route_credit_loss", "train/credit_probe_rate"):
+            value = trainer.callback_metrics.get(key)
+            if value is not None:
+                details[key] = float(value.detach())
+        print("DDP_SMOKE_CHECK", json.dumps(details), flush=True)
+
+
+@rank_zero_only
+def write_run_metadata(cfg, run_dir, manifest):
+    OmegaConf.save(cfg, run_dir / "config.yaml")
+    (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    print("RUN_MANIFEST", json.dumps(manifest, indent=2), flush=True)
 
 
 def training_forward(self, batch, stage, cfg):
@@ -96,7 +153,6 @@ def run(cfg):
     )
     run_dir = Path(swm.data.utils.get_cache_dir(sub_folder="checkpoints"), cfg.subdir)
     run_dir.mkdir(parents=True, exist_ok=True)
-    OmegaConf.save(cfg, run_dir / "config.yaml")
     root = Path(__file__).resolve().parents[1]
     source_files = [*root.glob("*.py"), *root.glob("channelwise/*.py"),
                     *root.glob("config/train/**/*.yaml")]
@@ -110,14 +166,18 @@ def run(cfg):
         "source_sha256": {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
                           for path in source_files},
         "torch": torch.__version__, "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "world_size": int(os.environ.get("WORLD_SIZE", 1)),
+        "per_rank_batch_size": int(cfg.loader.batch_size),
+        "global_batch_size": int(cfg.loader.batch_size) * int(os.environ.get("WORLD_SIZE", 1)),
     }
-    (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
-    print("RUN_MANIFEST", json.dumps(manifest, indent=2), flush=True)
+    write_run_metadata(cfg, run_dir, manifest)
     resume = ModelCheckpoint(dirpath=str(run_dir / "training_state"), filename="epoch-{epoch:02d}",
                              save_last=True, save_top_k=1, every_n_epochs=1, save_weights_only=False)
     trainer = pl.Trainer(
         **cfg.trainer, callbacks=[SaveCkptCallback(cfg.output_model_name, cfg.model),
-                                 RoutingStepCallback(), resume],
+                                 RoutingStepCallback(),
+                                 DistributedRuntimeCallback(run_dir, cfg.get("verify_ddp", False)),
+                                 resume],
         num_sanity_val_steps=1, logger=CSVLogger(str(run_dir), name="metrics", version="",
                                                flush_logs_every_n_steps=10),
         default_root_dir=str(run_dir),
